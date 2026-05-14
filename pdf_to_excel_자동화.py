@@ -54,23 +54,60 @@ def strip_headers_footers(page_texts: list, patterns: set) -> str:
 
 
 # ─── 줄 합치기 + 문장 분할 ────────────────────────────────
-_SENTENCE_END_RE = re.compile(
-    r"(?:[다요까네소오죠임함됨음라용니]|[a-zA-Z\)\]”’\"])[\.!?][\"'”’]?$"
-)
-_SENT_PAT = re.compile(
-    r"(?<=[다요까네소오죠임함됨음라용니])[\.!?][\"'”’]?(?=\s+|$)"
-    r"|(?<=[a-zA-Z\)\]”’\"])[\.!?][\"'”’]?(?=\s+|$)"
-)
+SHORT_LEN = 35  # 이 글자 수 미만이면 제목/항목 후보로 보고 다음 줄과 합치지 않음
+
+# 한국어 종결어미: 종성 없는 "다/요/까/네/소/오/죠/라/용/니" + ㅁ 받침을 가진 모든 한글(임/함/됨/음/짐/님/감 등)
+_TERMINAL_NON_M = set("다요까네소오죠라용니")
+_CLOSE_BRACKETS = set(")]”’\"'")
+_END_PUNCT = set(".!?")
+
+# 불릿/정의 박스 시작 패턴 → 항상 별도 행으로 처리
+_BULLET_RE = re.compile(r"^\s*([·•▪▫◦■□▶▷◆◇★☆※]|\[)")
+
+
+def _has_m_jongseong(ch: str) -> bool:
+    if not ch or not ("가" <= ch <= "힣"):
+        return False
+    return (ord(ch) - 0xAC00) % 28 == 16
+
+
+def _is_korean_terminal(ch: str) -> bool:
+    return ch in _TERMINAL_NON_M or _has_m_jongseong(ch)
+
+
+def _is_sentence_end(text: str) -> bool:
+    """줄 끝이 한국어 종결로 끝나는지 (닫는 괄호/따옴표는 건너뛴 뒤 직전 글자 검사)."""
+    text = text.rstrip()
+    if len(text) < 2 or text[-1] not in _END_PUNCT:
+        return False
+    idx = len(text) - 2
+    while idx >= 0 and text[idx] in _CLOSE_BRACKETS:
+        idx -= 1
+    if idx < 0:
+        return False
+    return _is_korean_terminal(text[idx])
+
+
+def _looks_word_break(next_line: str) -> bool:
+    """다음 줄 첫 어절이 1~3자 한글이고 종결 부호로 끝나면 단어 잘림 케이스
+    (예: "되었\n다." → "되었다.")."""
+    stripped = next_line.lstrip()
+    if not stripped:
+        return False
+    first_token = stripped.split()[0]
+    core = re.sub(r"[\.\!\?\"'”’]+$", "", first_token)
+    if not (1 <= len(core) <= 3):
+        return False
+    # 숫자만이면 번호 매김 → 단어 잘림 아님
+    if core.isdigit():
+        return False
+    return bool(re.search(r"[\.\!\?]", first_token))
 
 
 def smart_split(full_text: str) -> list:
     raw_lines = [l for l in full_text.split("\n") if l.strip()]
     if not raw_lines:
         return []
-
-    max_len = max(len(l) for l in raw_lines)
-    # 본문 너비를 거의 채운 줄은 다음 줄로 이어진다고 본다
-    threshold = max(int(max_len * 0.85), 30)
 
     merged = []
     buffer = ""
@@ -80,31 +117,47 @@ def smart_split(full_text: str) -> list:
             buffer = line
             continue
 
-        prev_long = len(buffer) >= threshold
-        prev_ends = bool(_SENTENCE_END_RE.search(buffer.rstrip()))
+        # 다음 줄이 불릿/정의 박스로 시작 → 새 항목, 합치지 않고 끊음
+        if _BULLET_RE.match(line):
+            merged.append(buffer)
+            buffer = line
+            continue
+        # 현재 buffer가 불릿/정의 박스로 시작 → 그 자체로 마무리
+        if _BULLET_RE.match(buffer):
+            merged.append(buffer)
+            buffer = line
+            continue
 
-        if prev_ends or not prev_long:
+        prev_ends = _is_sentence_end(buffer)
+        prev_short = len(buffer) < SHORT_LEN
+
+        if prev_ends or prev_short:
             merged.append(buffer)
             buffer = line
         else:
-            last_char = buffer[-1]
-            first_char = line[0]
-            # 한글+(한글|여는괄호) → 공백 없이 (PDF 단어 잘림 복원)
-            if re.match(r"[가-힣]", last_char) and re.match(r"[가-힣\(\[]", first_char):
-                buffer += line
+            if _looks_word_break(line):
+                buffer += line  # 단어 잘림 복원
             else:
                 buffer += " " + line
     if buffer:
         merged.append(buffer)
 
+    # 합쳐진 행 내부에서 한국어 종결 마침표 위치마다 문장 분할
     out = []
+    end_punct_re = re.compile(r"[\.!?][\"'”’]?")
     for line in merged:
         last = 0
-        for m in _SENT_PAT.finditer(line):
-            chunk = line[last:m.end()].strip()
+        for m in end_punct_re.finditer(line):
+            end = m.end()
+            # 종결 부호 뒤가 공백 또는 줄 끝이 아니면 skip
+            if end < len(line) and not line[end].isspace():
+                continue
+            if not _is_sentence_end(line[:end]):
+                continue
+            chunk = line[last:end].strip()
             if chunk:
                 out.append(chunk)
-            last = m.end()
+            last = end
         tail = line[last:].strip()
         if tail:
             out.append(tail)
@@ -144,6 +197,7 @@ def main() -> int:
         return 0
 
     rows = []
+    image_only_files = []  # 텍스트 추출이 안 된 PDF (이미지 기반)
     for file in os.listdir(folder_path):
         if not file.lower().endswith(".pdf"):
             continue
@@ -151,6 +205,10 @@ def main() -> int:
         path = os.path.join(folder_path, file)
         with pdfplumber.open(path) as pdf:
             page_texts = [p.extract_text() or "" for p in pdf.pages]
+
+        if not any(t.strip() for t in page_texts):
+            image_only_files.append(file)
+            continue
 
         patterns = detect_repeated_edges(page_texts)
         cleaned_text = strip_headers_footers(page_texts, patterns)
@@ -162,17 +220,25 @@ def main() -> int:
             rows.append([file, s])
 
     if not rows:
-        show_warning(
-            "텍스트를 추출하지 못했습니다.\n"
-            "PDF가 이미지 기반일 수 있습니다 (OCR 필요)."
-        )
+        msg = "텍스트를 추출하지 못했습니다."
+        if image_only_files:
+            msg += "\n\n이미지 기반 PDF로 보이는 파일:\n" + "\n".join(
+                f" - {f}" for f in image_only_files
+            )
+            msg += "\n\nOCR 기능이 없는 현재 버전으로는 처리할 수 없습니다."
+        show_warning(msg)
         return 0
 
     df = pd.DataFrame(rows, columns=["파일", "텍스트"])
     output_path = os.path.join(folder_path, "통합_결과.xlsx")
     df.to_excel(output_path, index=False, engine="openpyxl")
 
-    show_info(f"완료!\n\n결과 파일:\n{output_path}")
+    completion = f"완료!\n\n결과 파일:\n{output_path}"
+    if image_only_files:
+        completion += "\n\n다음 파일은 이미지 기반으로 보여 건너뛰었습니다:\n" + "\n".join(
+            f" - {f}" for f in image_only_files
+        )
+    show_info(completion)
     return 0
 
 
