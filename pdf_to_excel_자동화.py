@@ -162,19 +162,37 @@ def smart_split(full_text: str) -> list:
     # 합쳐진 행 내부에서 한국어 종결 마침표 위치마다 문장 분할
     out = []
     end_punct_re = re.compile(r"[\.!?][\"'”’]?")
+    closing_chars = ">)]”’\"'"
     for line in merged:
         last = 0
         for m in end_punct_re.finditer(line):
             end = m.end()
-            # 종결 부호 뒤가 공백 또는 줄 끝이 아니면 skip
-            if end < len(line) and not line[end].isspace():
+            # 종결 부호 뒤가 공백/줄 끝/닫는 기호 이외이면 skip (닫는 기호는 아래에서 흡수)
+            if end < len(line) and not line[end].isspace() and line[end] not in closing_chars:
+                continue
+            # 종결 부호 다음의 "공백 + 닫는 기호" 묶음을 모두 분할 위치 뒤로 흡수
+            # (예: "< 예시. > 그 다음" → 첫 묶음은 "< 예시. >" 가 되고 분할은 그 뒤에서 일어남)
+            extended = end
+            while extended < len(line):
+                j = extended
+                while j < len(line) and line[j] == " ":
+                    j += 1
+                if j < len(line) and line[j] in closing_chars:
+                    k = j
+                    while k < len(line) and line[k] in closing_chars:
+                        k += 1
+                    extended = k
+                else:
+                    break
+            # 흡수 후 위치가 줄 끝이거나 공백이어야 분할 가능
+            if extended < len(line) and not line[extended].isspace():
                 continue
             if not _is_sentence_end(line[:end]):
                 continue
-            chunk = line[last:end].strip()
+            chunk = line[last:extended].strip()
             if chunk:
                 out.append(chunk)
-            last = end
+            last = extended
         tail = line[last:].strip()
         if tail:
             out.append(tail)
