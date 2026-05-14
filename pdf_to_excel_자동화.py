@@ -63,6 +63,8 @@ _END_PUNCT = set(".!?")
 
 # 불릿/정의 박스 시작 패턴 → 항상 별도 행으로 처리
 _BULLET_RE = re.compile(r"^\s*([·•▪▫◦■□▶▷◆◇★☆※]|\[)")
+# 닫는 기호만 단독으로 있는 줄 → 이전 줄에 공백 없이 합치기 (예: PDF가 ">"를 다음 줄로 떼어놓은 경우)
+_CLOSE_ONLY_RE = re.compile(r"^\s*[>)\]\"”’]+\s*$")
 
 
 def _has_m_jongseong(ch: str) -> bool:
@@ -86,6 +88,12 @@ def _is_sentence_end(text: str) -> bool:
     if idx < 0:
         return False
     return _is_korean_terminal(text[idx])
+
+
+def _is_open_bracket(text: str) -> bool:
+    """'['로 시작했지만 같은 줄에 ']'가 없는 줄 (멀티라인 정의 박스의 시작)."""
+    s = text.strip()
+    return s.startswith("[") and "]" not in s
 
 
 def _looks_word_break(next_line: str) -> bool:
@@ -117,13 +125,22 @@ def smart_split(full_text: str) -> list:
             buffer = line
             continue
 
+        # 닫는 기호 단독 줄 (예: ">", ")") → 이전 buffer에 공백 없이 합치기
+        if _CLOSE_ONLY_RE.fullmatch(line):
+            buffer += line
+            continue
+
+        # buffer가 '[' 시작이지만 ']'로 닫히지 않았으면 닫힐 때까지 계속 합치기
+        buffer_unclosed = _is_open_bracket(buffer)
+
         # 다음 줄이 불릿/정의 박스로 시작 → 새 항목, 합치지 않고 끊음
-        if _BULLET_RE.match(line):
+        # 단, buffer가 미완성 '['이면 새 항목 트리거 무시
+        if _BULLET_RE.match(line) and not buffer_unclosed:
             merged.append(buffer)
             buffer = line
             continue
-        # 현재 buffer가 불릿/정의 박스로 시작 → 그 자체로 마무리
-        if _BULLET_RE.match(buffer):
+        # 현재 buffer가 불릿/정의 박스로 시작 → 그 자체로 마무리 (단, 미완성 '['은 예외)
+        if _BULLET_RE.match(buffer) and not buffer_unclosed:
             merged.append(buffer)
             buffer = line
             continue
@@ -131,7 +148,7 @@ def smart_split(full_text: str) -> list:
         prev_ends = _is_sentence_end(buffer)
         prev_short = len(buffer) < SHORT_LEN
 
-        if prev_ends or prev_short:
+        if (prev_ends or prev_short) and not buffer_unclosed:
             merged.append(buffer)
             buffer = line
         else:
